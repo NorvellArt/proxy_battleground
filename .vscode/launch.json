@@ -2,10 +2,10 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "proxy_battleground run",
+            "name": "Debug Proxy",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/bin/proxy_battleground",
+            "program": "${workspaceFolder}/build/proxy_battleground",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
@@ -19,7 +19,7 @@
                     "ignoreFailures": true
                 }
             ],
-            "preLaunchTask": "build_project",
+            "preLaunchTask": "Cmake Build",
             "miDebuggerPath": "/usr/bin/gdb"
         }
     ]
