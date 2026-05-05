@@ -16,7 +16,13 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(wsserver_lib)
 
-add_executable(proxy_battleground ./src/main.c)
+add_executable(
+    proxy_battleground
+    
+    ./src/main.c
+    ./src/client_context.c
+    )
 
-target_link_libraries(proxy_battleground PRIVATE ws)
+target_link_libraries(proxy_battleground PRIVATE ws pthread)
+target_include_directories(proxy_battleground PUBLIC include)
 target_include_directories(proxy_battleground PRIVATE ${wsserver_lib_SOURCE_DIR}/include)
