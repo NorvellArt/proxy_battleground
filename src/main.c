@@ -8,7 +8,6 @@
 
 int epoll_fd;
 
-// Поток для чтения ответов от сайтов (например, от Google) и отправки их в телефон
 void *epoll_loop_thread(void *arg) {
     struct epoll_event events[MAX_EVENTS];
     unsigned char *buffer = malloc(BUF_SIZE);
@@ -17,18 +16,20 @@ void *epoll_loop_thread(void *arg) {
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
         for (int i = 0; i < nfds; i++) {
             client_ctx_t *ctx = (client_ctx_t *)events[i].data.ptr;
+            
+            // Проверка: сокет может быть уже закрыт в onclose
+            if (!ctx || ctx->target_fd == -1) continue; 
 
             ssize_t n = recv(ctx->target_fd, buffer, BUF_SIZE, 0);
             if (n > 0) {
-                // Данные от сайта -> в WebSocket (телефон)
+                // ВАЖНО: Проверь, жива ли еще WebSocket сессия перед отправкой
                 ws_sendframe_bin(ctx->ws_conn, buffer, n);
             } else {
-                // Ошибка или закрытие соединения со стороны сайта
-                printf("Target closed connection\n");
-                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->target_fd, NULL);
-                close(ctx->target_fd);
-                // Тут стоило бы закрыть и ws-соединение, но для примера оставим так
-                free(ctx);
+                printf("Target closed connection or error\n");
+                
+                // Вместо ручного удаления тут, лучше "попросить" WebSocket закрыться.
+                // Это вызовет цепочку: ws_close -> onclose -> remove_ctx (безопасно)
+                ws_close_client(ctx->ws_conn); 
             }
         }
     }
@@ -47,8 +48,15 @@ void onclose(ws_cli_conn_t client)
 {
     printf("Connection closed\n");
     client_ctx_t *ctx = get_ctx_by_client(client);
+    
     if (ctx) {
+        // 1. Убираем из epoll, чтобы поток epoll_loop больше не трогал этот ctx
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->target_fd, NULL);
+        
+        // 2. Закрываем соединение с сайтом
+        close(ctx->target_fd);
+        
+        // 3. Удаляем из списка и free(ctx)
         remove_ctx(client);
     }
 }
@@ -57,87 +65,102 @@ void onmessage(ws_cli_conn_t client, const unsigned char *msg, uint64_t size, in
 {
     if (size == 0) return;
 
-    client_ctx_t *ctx = get_ctx_by_client(client);
+    // --- 1. ПРОВЕРКА СУЩЕСТВУЮЩЕГО КОНТЕКСТА ---
+    // Используем безопасную функцию с lock внутри
+    client_ctx_t *ctx = get_ctx_by_client(client); 
+    
+    if (ctx) {
+        if (ctx->is_handshaked) {
+            ssize_t sent = send(ctx->target_fd, msg, size, 0);
+            printf("DEBUG: Forwarded %zd bytes to target\n", sent);
+        }
+        return; // Если контекст есть, дальше (на парсинг) не идем никогда
+    }
 
-    if (ctx && ctx->is_handshaked) {
-        send(ctx->target_fd, msg, size, 0);
+    // --- 2. ПАРСИНГ НОВОГО СОЕДИНЕНИЯ (VLESS) ---
+    if (type != WS_FR_OP_BIN) return;
+    if (size < 20) {
+        printf("DEBUG: Packet too small for VLESS: %lu\n", size);
         return;
     }
 
-    if (type != WS_FR_OP_BIN) return;
-
-    // В учебном примере считаем, что первый пакет всегда содержит заголовок VLESS.
-    // В реальном прокси нужно хранить состояние 'handshaked' в контексте клиента.
-    
-    if (size < 20) return; // Минимум для VLESS
-
     int cursor = 0;
-    uint8_t ver = msg[cursor++];     // 0
-    cursor += 16;                    // Пропускаем UUID
-    uint8_t a_len = msg[cursor++];   // Читаем длину дополнений
-    cursor += a_len;                 // Прыгаем через дополнения
+    uint8_t ver = msg[cursor++];     
+    cursor += 16;                    // UUID
+    uint8_t a_len = msg[cursor++];   
     
-    uint8_t cmd = msg[cursor++];     // Команда
+    // Проверка, чтобы cursor не вышел за пределы пакета
+    if (cursor + a_len >= size) return;
+    cursor += a_len;                 
+    
+    uint8_t cmd = msg[cursor++];     
     uint16_t port = (msg[cursor] << 8) | msg[cursor + 1];
     cursor += 2;
     
     uint8_t addr_type = msg[cursor++];
-    char target_addr[256];
+    char target_addr[256] = {0};
 
     if (addr_type == 0x01) { // IPv4
         inet_ntop(AF_INET, &msg[cursor], target_addr, sizeof(target_addr));
         cursor += 4;
     } else if (addr_type == 0x02) { // Domain
         uint8_t len = msg[cursor++];
-            if (len > 0 && len < 255) {
+        if (len > 0 && cursor + len <= size) {
             memcpy(target_addr, &msg[cursor], len);
             target_addr[len] = '\0';
             cursor += len;
         } else {
-            strcpy(target_addr, "invalid-domain");
+            return;
         }
+    } else {
+        printf("DEBUG: Unknown address type: %d\n", addr_type);
+        return;
     }
 
     printf("Connecting to %s:%d\n", target_addr, port);
 
+    // --- 3. УСТАНОВКА СОЕДИНЕНИЯ ---
     struct addrinfo hints = {0}, *res;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
     char port_str[6];
-    snprintf(port_str, sizeof(port_str), "%d", port);
+    snprintf(port_str, sizeof(port_str), "%u", port);
 
-    // DNS-резолвинг (блокирующий, но решает проблему доменов)
     if (getaddrinfo(target_addr, port_str, &hints, &res) != 0) {
         return; 
     }
 
     int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) {
+        freeaddrinfo(res);
+        return;
+    }
 
-   if (connect(sock, res->ai_addr, res->ai_addrlen) == 0) {
-        freeaddrinfo(res); // Освобождаем память DNS
+    if (connect(sock, res->ai_addr, res->ai_addrlen) == 0) {
+        freeaddrinfo(res);
         fcntl(sock, F_SETFL, O_NONBLOCK);
 
-        // Сначала создаем контекст, чтобы на следующие пакеты ctx уже был готов
+        // Создаем контекст (is_handshaked должен стать true внутри create_ctx)
         create_ctx(client, sock); 
+        
+        // Получаем созданный контекст для регистрации в epoll
         client_ctx_t *new_ctx = get_ctx_by_client(client);
         if (new_ctx) {
-            new_ctx->is_handshaked = true;
-
-            // Регистрируем в epoll, чтобы начать слушать ответы от сайта
             struct epoll_event ev = {.events = EPOLLIN, .data.ptr = new_ctx};
             epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev);
         }
 
-        // Теперь подтверждаем клиенту, что соединение готово
+        // Ответ клиенту (VLESS response)
         unsigned char vless_resp[] = {0x00, 0x00};
         ws_sendframe_bin(client, vless_resp, 2);
 
-        // 4. Пробрасываем полезную нагрузку (payload), если она была в первом пакете
+        // Пробрасываем остаток данных (payload)
         if (size > cursor) {
             send(sock, &msg[cursor], size - cursor, 0);
         }
     } else {
+        perror("Connect failed");
         freeaddrinfo(res);
         close(sock);
     }

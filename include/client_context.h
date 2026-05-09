@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <pthread.h>
 
 #include <ws.h>
 
@@ -15,6 +16,8 @@ typedef struct client_ctx{
     struct client_ctx *next;
 } client_ctx_t;
 
+extern client_ctx_t *ctx_list;
+extern pthread_mutex_t list_lock;
 
 client_ctx_t *get_ctx_by_client(ws_cli_conn_t client);
 void create_ctx(ws_cli_conn_t client, int target_fd);

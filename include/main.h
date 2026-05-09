@@ -3,7 +3,6 @@
 
 #include <sys/epoll.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <string.h>
