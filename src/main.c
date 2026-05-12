@@ -24,12 +24,10 @@ void *epoll_loop_thread(void *arg) {
 
             ssize_t n = recv(ctx->target_fd, buffer, BUF_SIZE, 0);
             if (n > 0) {
-                if (!atomic_load(&ctx->is_closing)) {
-                    ws_sendframe_bin(ctx->ws_conn, buffer, n);
-                }
+                ctx_send_bin(ctx, buffer, n);
             } else {
                 printf("Target closed connection or error\n");
-                
+
                 if (!atomic_load(&ctx->is_closing)) {
                     ws_close_client(ctx->ws_conn);
                 }
@@ -53,13 +51,16 @@ void onclose(ws_cli_conn_t client)
     client_ctx_t *ctx = get_ctx_by_client(client);
     
     if (ctx) {
-        atomic_store(&ctx->is_closing, true); // 1. сигнал для epoll_loop
+        // Захватываем lock: ждём завершения текущего ws_sendframe_bin если он идёт
+        pthread_mutex_lock(&ctx->ws_send_lock);
+        atomic_store(&ctx->is_closing, true);  // теперь ctx_send_bin увидит флаг
+        pthread_mutex_unlock(&ctx->ws_send_lock);
 
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->target_fd, NULL); // 2. убираем из epoll
-        close(ctx->target_fd);                // 3. закрываем TCP
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->target_fd, NULL);
+        close(ctx->target_fd);
 
-        ctx_unref(ctx);                       // 4. отпускаем ссылку get_ctx_by_client
-        remove_ctx(client);                   // 5. отпускаем ссылку списка → free если никто не держит
+        ctx_unref(ctx);
+        remove_ctx(client);
     }
 }
 
