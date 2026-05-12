@@ -17,19 +17,22 @@ void *epoll_loop_thread(void *arg) {
         for (int i = 0; i < nfds; i++) {
             client_ctx_t *ctx = (client_ctx_t *)events[i].data.ptr;
             
-            // Проверка: сокет может быть уже закрыт в onclose
-            if (!ctx || ctx->target_fd == -1) continue; 
+            if (!ctx) continue;
+            
+            // Проверяем флаг ДО любой работы с ctx
+            if (atomic_load(&ctx->is_closing)) continue;
 
             ssize_t n = recv(ctx->target_fd, buffer, BUF_SIZE, 0);
             if (n > 0) {
-                // ВАЖНО: Проверь, жива ли еще WebSocket сессия перед отправкой
-                ws_sendframe_bin(ctx->ws_conn, buffer, n);
+                if (!atomic_load(&ctx->is_closing)) {
+                    ws_sendframe_bin(ctx->ws_conn, buffer, n);
+                }
             } else {
                 printf("Target closed connection or error\n");
                 
-                // Вместо ручного удаления тут, лучше "попросить" WebSocket закрыться.
-                // Это вызовет цепочку: ws_close -> onclose -> remove_ctx (безопасно)
-                ws_close_client(ctx->ws_conn); 
+                if (!atomic_load(&ctx->is_closing)) {
+                    ws_close_client(ctx->ws_conn);
+                }
             }
         }
     }
@@ -50,14 +53,13 @@ void onclose(ws_cli_conn_t client)
     client_ctx_t *ctx = get_ctx_by_client(client);
     
     if (ctx) {
-        // 1. Убираем из epoll, чтобы поток epoll_loop больше не трогал этот ctx
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->target_fd, NULL);
-        
-        // 2. Закрываем соединение с сайтом
-        close(ctx->target_fd);
-        
-        // 3. Удаляем из списка и free(ctx)
-        remove_ctx(client);
+        atomic_store(&ctx->is_closing, true); // 1. сигнал для epoll_loop
+
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->target_fd, NULL); // 2. убираем из epoll
+        close(ctx->target_fd);                // 3. закрываем TCP
+
+        ctx_unref(ctx);                       // 4. отпускаем ссылку get_ctx_by_client
+        remove_ctx(client);                   // 5. отпускаем ссылку списка → free если никто не держит
     }
 }
 
@@ -74,6 +76,7 @@ void onmessage(ws_cli_conn_t client, const unsigned char *msg, uint64_t size, in
             ssize_t sent = send(ctx->target_fd, msg, size, 0);
             printf("DEBUG: Forwarded %zd bytes to target\n", sent);
         }
+        ctx_unref(ctx);
         return; // Если контекст есть, дальше (на парсинг) не идем никогда
     }
 
@@ -149,6 +152,9 @@ void onmessage(ws_cli_conn_t client, const unsigned char *msg, uint64_t size, in
         if (new_ctx) {
             struct epoll_event ev = {.events = EPOLLIN, .data.ptr = new_ctx};
             epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev);
+            ctx_unref(new_ctx); // отпускаем ссылку get_ctx_by_client
+            // epoll держит указатель но НЕ ref — это нормально,
+            // т.к. is_closing защищает от обращения после free
         }
 
         // Ответ клиенту (VLESS response)

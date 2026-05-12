@@ -1,16 +1,29 @@
 #include "client_context.h"
 
 static client_ctx_t *get_ctx_inner(ws_cli_conn_t client);
+static void ctx_free(client_ctx_t *ctx);
 
 client_ctx_t *ctx_list = NULL;
 pthread_mutex_t list_lock = PTHREAD_MUTEX_INITIALIZER;
 
+void ctx_unref(client_ctx_t *ctx)
+{
+    if (!ctx) return;
+    // fetch_sub возвращает значение ДО вычитания
+    if (atomic_fetch_sub(&ctx->ref_count, 1) == 1) {
+        ctx_free(ctx);
+    }
+}
+
 client_ctx_t *get_ctx_by_client(ws_cli_conn_t client)
 {
     pthread_mutex_lock(&list_lock);
-    client_ctx_t *res = get_ctx_inner(client); // Используем внутреннюю логику
+    client_ctx_t *res = get_ctx_inner(client);
+    if (res) {
+        atomic_fetch_add(&res->ref_count, 1); // берём владение
+    }
     pthread_mutex_unlock(&list_lock);
-    return res;
+    return res; // вызывающий должен сделать ctx_unref() после использования
 }
 
 void create_ctx(ws_cli_conn_t client, int target_fd)
@@ -23,6 +36,8 @@ void create_ctx(ws_cli_conn_t client, int target_fd)
     new_node->ws_conn = client;
     new_node->target_fd = target_fd;
     new_node->is_handshaked = true;
+    atomic_init(&new_node->ref_count, 1);    // список держит 1 ссылку
+    atomic_init(&new_node->is_closing, false);
     
     // Вставляем в начало списка
     new_node->next = ctx_list;
@@ -39,13 +54,11 @@ void remove_ctx(ws_cli_conn_t client)
     while (*curr) {
         client_ctx_t *entry = *curr;
         if (entry->ws_conn == client) {
-            *curr = entry->next;
-            if (entry->target_fd != -1) {
-                close(entry->target_fd);
-            }
-            free(entry);
-            printf("Context removed successfully\n");
+            *curr = entry->next;  
             pthread_mutex_unlock(&list_lock);
+
+            printf("Context removed from list\n");
+            ctx_unref(entry);             // снимаем ссылку списка
             return;
         }
         curr = &entry->next;
@@ -61,4 +74,10 @@ static client_ctx_t *get_ctx_inner(ws_cli_conn_t client) {
         curr = curr->next;
     }
     return NULL;
+}
+
+static void ctx_free(client_ctx_t *ctx)
+{
+    free(ctx);
+    printf("Context freed\n");
 }
