@@ -5,8 +5,13 @@
 #include <netdb.h>
 
 #include "main.h"
+#include "connect_queue.h"
+
+// Количество воркеров для DNS+connect
+#define CONNECT_WORKERS 4
 
 int epoll_fd;
+
 
 void *epoll_loop_thread(void *arg) {
     struct epoll_event events[MAX_EVENTS];
@@ -73,7 +78,7 @@ void onmessage(ws_cli_conn_t client, const unsigned char *msg, uint64_t size, in
     client_ctx_t *ctx = get_ctx_by_client(client); 
     
     if (ctx) {
-        if (ctx->is_handshaked) {
+        if (ctx->is_handshaked && !atomic_load(&ctx->is_closing)) {
             ssize_t sent = send(ctx->target_fd, msg, size, 0);
             printf("DEBUG: Forwarded %zd bytes to target\n", sent);
         }
@@ -123,60 +128,36 @@ void onmessage(ws_cli_conn_t client, const unsigned char *msg, uint64_t size, in
 
     printf("Connecting to %s:%d\n", target_addr, port);
 
-    // --- 3. УСТАНОВКА СОЕДИНЕНИЯ ---
-    struct addrinfo hints = {0}, *res;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
+     // --- Копируем payload и ставим задачу в очередь ---
+    size_t payload_len = (size > (size_t)cursor) ? size - cursor : 0;
+    uint8_t *payload_copy = NULL;
 
-    char port_str[6];
-    snprintf(port_str, sizeof(port_str), "%u", port);
-
-    if (getaddrinfo(target_addr, port_str, &hints, &res) != 0) {
-        return; 
+    if (payload_len > 0) {
+        payload_copy = malloc(payload_len);
+        if (!payload_copy) return;
+        memcpy(payload_copy, &msg[cursor], payload_len);
     }
 
-    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) {
-        freeaddrinfo(res);
-        return;
-    }
+    connect_task_t *task = malloc(sizeof(connect_task_t));
+    if (!task) { free(payload_copy); return; }
 
-    if (connect(sock, res->ai_addr, res->ai_addrlen) == 0) {
-        freeaddrinfo(res);
-        fcntl(sock, F_SETFL, O_NONBLOCK);
+    task->client      = client;
+    task->port        = port;
+    task->payload     = payload_copy;
+    task->payload_len = payload_len;
+    memcpy(task->target_addr, target_addr, sizeof(target_addr));
 
-        // Создаем контекст (is_handshaked должен стать true внутри create_ctx)
-        create_ctx(client, sock); 
-        
-        // Получаем созданный контекст для регистрации в epoll
-        client_ctx_t *new_ctx = get_ctx_by_client(client);
-        if (new_ctx) {
-            struct epoll_event ev = {.events = EPOLLIN, .data.ptr = new_ctx};
-            epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev);
-            ctx_unref(new_ctx); // отпускаем ссылку get_ctx_by_client
-            // epoll держит указатель но НЕ ref — это нормально,
-            // т.к. is_closing защищает от обращения после free
-        }
-
-        // Ответ клиенту (VLESS response)
-        unsigned char vless_resp[] = {0x00, 0x00};
-        ws_sendframe_bin(client, vless_resp, 2);
-
-        // Пробрасываем остаток данных (payload)
-        if (size > cursor) {
-            send(sock, &msg[cursor], size - cursor, 0);
-        }
-    } else {
-        perror("Connect failed");
-        freeaddrinfo(res);
-        close(sock);
-    }
+    // Не блокируемся — onmessage сразу возвращается
+    connect_queue_push(&g_connect_queue, task);
 }
 
 int main()
 {
     // Создаем epoll
     epoll_fd = epoll_create1(0);
+
+    // Запускаем воркеры ДО старта WS-сервера
+    connect_workers_start(CONNECT_WORKERS, epoll_fd);
 
     // Запускаем поток для обработки ответов из интернета
     pthread_t thread;

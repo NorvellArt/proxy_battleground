@@ -21,6 +21,7 @@ add_executable(
     
     ./src/main.c
     ./src/client_context.c
+    ./src/connect_queue.c
     )
 
 target_link_libraries(proxy_battleground PRIVATE ws pthread)
