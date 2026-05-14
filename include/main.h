@@ -13,5 +13,6 @@
 
 #define MAX_EVENTS 64
 #define BUF_SIZE 16384
+#define EPOLL_WORKERS 4
 
 #endif

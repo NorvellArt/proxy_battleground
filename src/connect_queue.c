@@ -6,6 +6,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <netinet/tcp.h>
 
 #include "connect_queue.h"
 #include "client_context.h"
@@ -108,41 +109,63 @@ static void connect_worker_handle(connect_task_t *task, int epoll_fd)
     hints.ai_socktype = SOCK_STREAM;
 
     if (getaddrinfo(task->target_addr, port_str, &hints, &res) != 0) {
-        printf("DNS resolution failed for %s\n", task->target_addr);
+        printf("[worker] DNS failed for %s\n", task->target_addr);
         goto done;
     }
+    printf("[worker] DNS ok: %s:%u\n", task->target_addr, task->port);
 
     int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (sock < 0) {
+        printf("[worker] socket() failed\n");
         freeaddrinfo(res);
         goto done;
     }
 
     if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+        printf("[worker] connect() failed: %s\n", strerror(errno));
         perror("Connect failed");
         freeaddrinfo(res);
         close(sock);
         goto done;
     }
+    printf("[worker] connected fd=%d\n", sock);
 
     freeaddrinfo(res);
     fcntl(sock, F_SETFL, O_NONBLOCK);
 
-    create_ctx(task->client, sock);
+
+    int flag = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
     client_ctx_t *ctx = get_ctx_by_client(task->client);
-    if (ctx) {
-        struct epoll_event ev = {.events = EPOLLIN, .data.ptr = ctx};
-        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev);
-        ctx_unref(ctx);
+    if (!ctx) {
+        // WS-клиент уже отключился пока мы делали DNS+connect
+        printf("[worker] client gone after connect, closing fd=%d\n", sock);
+        close(sock);
+        goto done;
     }
+
+    ctx->target_fd = sock;
+    
+    printf("[worker] ctx ok, state -> CONNECTED\n");
+
+    struct epoll_event ev = {.events = EPOLLIN, .data.ptr = ctx};
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev);
 
     unsigned char vless_resp[] = {0x00, 0x00};
     ws_sendframe_bin(task->client, (char *)vless_resp, 2);
+    printf("[worker] vless_resp sent\n");
 
     if (task->payload_len > 0) {
-        send(sock, task->payload, task->payload_len, 0);
+        ssize_t s = send(sock, task->payload, task->payload_len, 0);
+        printf("[worker] payload sent: %zd bytes\n", s);
     }
+
+    atomic_store(&ctx->state, CTX_STATE_CONNECTED);
+    ctx_flush_pending(ctx);
+    printf("[worker] pending flushed\n");
+
+    ctx_unref(ctx);
 
 done:
     free((void *)task->payload);

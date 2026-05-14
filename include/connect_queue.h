@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <pthread.h>
+#include <errno.h>
 #include <ws.h>
 
 // Задача на установку соединения

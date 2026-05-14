@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <netdb.h>
+#include <errno.h>
 
 #include "main.h"
 #include "connect_queue.h"
@@ -14,31 +15,40 @@ int epoll_fd;
 
 
 void *epoll_loop_thread(void *arg) {
+    int epoll_fd = *(int *)arg;
     struct epoll_event events[MAX_EVENTS];
-    unsigned char *buffer = malloc(BUF_SIZE);
+    unsigned char *buffer = malloc(BUF_SIZE); // каждый поток — свой буфер
 
     while (1) {
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
         for (int i = 0; i < nfds; i++) {
             client_ctx_t *ctx = (client_ctx_t *)events[i].data.ptr;
-            
             if (!ctx) continue;
-            
-            // Проверяем флаг ДО любой работы с ctx
             if (atomic_load(&ctx->is_closing)) continue;
 
             ssize_t n = recv(ctx->target_fd, buffer, BUF_SIZE, 0);
             if (n > 0) {
                 ctx_send_bin(ctx, buffer, n);
+            // epoll_loop_thread
+            } else if (n == 0) {
+                bool expected = false;
+                if (atomic_compare_exchange_strong(&ctx->is_closing, &expected, true)) {
+                    // Сразу убираем из epoll — другие потоки больше не получат событий на этот fd
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->target_fd, NULL);
+                    ws_close_client(ctx->ws_conn);
+                }
             } else {
-                printf("Target closed connection or error\n");
-
-                if (!atomic_load(&ctx->is_closing)) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                
+                bool expected = false;
+                if (atomic_compare_exchange_strong(&ctx->is_closing, &expected, true)) {
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->target_fd, NULL);
                     ws_close_client(ctx->ws_conn);
                 }
             }
         }
     }
+
     free(buffer);
     return NULL;
 }
@@ -54,19 +64,21 @@ void onclose(ws_cli_conn_t client)
 {
     printf("Connection closed\n");
     client_ctx_t *ctx = get_ctx_by_client(client);
-    
-    if (ctx) {
-        // Захватываем lock: ждём завершения текущего ws_sendframe_bin если он идёт
-        pthread_mutex_lock(&ctx->ws_send_lock);
-        atomic_store(&ctx->is_closing, true);  // теперь ctx_send_bin увидит флаг
-        pthread_mutex_unlock(&ctx->ws_send_lock);
 
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->target_fd, NULL);
-        close(ctx->target_fd);
-
-        ctx_unref(ctx);
-        remove_ctx(client);
+    if (!ctx) {
+        printf("onclose: context already removed\n");
+        return;
     }
+    
+    pthread_mutex_lock(&ctx->ws_send_lock);
+    atomic_store(&ctx->is_closing, true);
+    pthread_mutex_unlock(&ctx->ws_send_lock);
+
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->target_fd, NULL);
+    close(ctx->target_fd);
+
+    ctx_unref(ctx);   // отпускаем ссылку get_ctx_by_client
+    remove_ctx(client); // отпускаем ссылку списка
 }
 
 void onmessage(ws_cli_conn_t client, const unsigned char *msg, uint64_t size, int type)
@@ -78,12 +90,17 @@ void onmessage(ws_cli_conn_t client, const unsigned char *msg, uint64_t size, in
     client_ctx_t *ctx = get_ctx_by_client(client); 
     
     if (ctx) {
-        if (ctx->is_handshaked && !atomic_load(&ctx->is_closing)) {
-            ssize_t sent = send(ctx->target_fd, msg, size, 0);
-            printf("DEBUG: Forwarded %zd bytes to target\n", sent);
+        if (!atomic_load(&ctx->is_closing)) {
+            if (atomic_load(&ctx->state) == CTX_STATE_CONNECTING) {
+                // Воркер ещё не подключился — буферизуем
+                ctx_enqueue_pending(ctx, msg, size);
+            } else {
+                // Соединение есть — форвардим сразу
+                send(ctx->target_fd, msg, size, 0);
+            }
         }
         ctx_unref(ctx);
-        return; // Если контекст есть, дальше (на парсинг) не идем никогда
+        return;
     }
 
     // --- 2. ПАРСИНГ НОВОГО СОЕДИНЕНИЯ (VLESS) ---
@@ -147,6 +164,8 @@ void onmessage(ws_cli_conn_t client, const unsigned char *msg, uint64_t size, in
     task->payload_len = payload_len;
     memcpy(task->target_addr, target_addr, sizeof(target_addr));
 
+    create_ctx(client, -1);
+
     // Не блокируемся — onmessage сразу возвращается
     connect_queue_push(&g_connect_queue, task);
 }
@@ -159,9 +178,13 @@ int main()
     // Запускаем воркеры ДО старта WS-сервера
     connect_workers_start(CONNECT_WORKERS, epoll_fd);
 
-    // Запускаем поток для обработки ответов из интернета
-    pthread_t thread;
-    pthread_create(&thread, NULL, epoll_loop_thread, NULL);
+    // Несколько потоков на один epoll_fd — это безопасно,
+    // ядро само распределяет события между ними
+    for (int i = 0; i < EPOLL_WORKERS; i++) {
+        pthread_t t;
+        pthread_create(&t, NULL, epoll_loop_thread, &epoll_fd);
+        pthread_detach(t);
+    }
     
     ws_socket(&(struct ws_server){
         .host = "0.0.0.0",
