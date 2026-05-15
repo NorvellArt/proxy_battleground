@@ -30,6 +30,7 @@ void *epoll_loop_thread(void *arg) {
             while (1) {
                 ssize_t n = recv(ctx->target_fd, buffer, BUF_SIZE, 0);
                 if (n > 0) {
+                    printf("DEBUG: From Target: %zd bytes for client %p\n", n, (void*)ctx->ws_conn);
                     ctx_send_bin(ctx, buffer, n);
                     continue;
                 }

@@ -162,7 +162,7 @@ static void connect_worker_handle(connect_task_t *task, int epoll_fd)
     /* VLESS-ответ: используем safe_send (сокет ещё блокирующий не нужен,
        но safe_send корректно отработает и здесь) */
     unsigned char vless_resp[] = {0x00, 0x00};
-    if (safe_send(sock, vless_resp, 2) < 0) {
+    if (ctx_send_bin(ctx, vless_resp, 2) < 0) {
         printf("[worker] failed to send vless_resp\n");
         ctx_unref(ctx);
         goto done;
