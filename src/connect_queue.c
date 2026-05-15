@@ -42,11 +42,10 @@ void connect_queue_push(connect_queue_t *q, connect_task_t *task)
     }
     q->tail = task;
 
-    pthread_cond_signal(&q->cond);    // будим одного воркера
+    pthread_cond_signal(&q->cond);
     pthread_mutex_unlock(&q->lock);
 }
 
-// Блокируется пока нет задач или не пришёл shutdown
 connect_task_t *connect_queue_pop(connect_queue_t *q)
 {
     pthread_mutex_lock(&q->lock);
@@ -68,7 +67,6 @@ connect_task_t *connect_queue_pop(connect_queue_t *q)
     return task;
 }
 
-// Воркер: берёт задачу, делает getaddrinfo + connect в фоне
 static void *connect_worker(void *arg)
 {
     worker_arg_t *warg = (worker_arg_t *)arg;
@@ -77,7 +75,7 @@ static void *connect_worker(void *arg)
 
     while (1) {
         connect_task_t *task = connect_queue_pop(&g_connect_queue);
-        if (!task) break;   // shutdown
+        if (!task) break;
 
         connect_worker_handle(task, epoll_fd);
     }
@@ -98,7 +96,6 @@ void connect_workers_start(int n_workers, int epoll_fd)
     }
 }
 
-// Отдельная функция — нет goto через объявления, нет утечки
 static void connect_worker_handle(connect_task_t *task, int epoll_fd)
 {
     char port_str[6];
@@ -121,9 +118,15 @@ static void connect_worker_handle(connect_task_t *task, int epoll_fd)
         goto done;
     }
 
+    /* ---- Увеличиваем буферы ядра до подключения ---- */
+    {
+        int bufsize = 256 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+    }
+
     if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
         printf("[worker] connect() failed: %s\n", strerror(errno));
-        perror("Connect failed");
         freeaddrinfo(res);
         close(sock);
         goto done;
@@ -131,43 +134,51 @@ static void connect_worker_handle(connect_task_t *task, int epoll_fd)
     printf("[worker] connected fd=%d\n", sock);
 
     freeaddrinfo(res);
-    fcntl(sock, F_SETFL, O_NONBLOCK);
 
+    /* Переводим в неблокирующий режим ПОСЛЕ connect */
+    fcntl(sock, F_SETFL, O_NONBLOCK);
 
     int flag = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
     client_ctx_t *ctx = get_ctx_by_client(task->client);
     if (!ctx) {
-        // WS-клиент уже отключился пока мы делали DNS+connect
         printf("[worker] client gone after connect, closing fd=%d\n", sock);
         close(sock);
         goto done;
     }
 
     ctx->target_fd = sock;
-
     printf("[worker] ctx ok, state -> CONNECTED\n");
 
-    struct epoll_event ev = {.events = EPOLLIN, .data.ptr = ctx};
+    /* EPOLLONESHOT: после срабатывания fd автоматически отключается из epoll.
+       Только один поток обработает событие, затем переармирует через MOD. */
+    struct epoll_event ev = {
+        .events = EPOLLIN | EPOLLET | EPOLLONESHOT,
+        .data.ptr = ctx
+    };
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev);
 
+    /* VLESS-ответ: используем safe_send (сокет ещё блокирующий не нужен,
+       но safe_send корректно отработает и здесь) */
     unsigned char vless_resp[] = {0x00, 0x00};
-    ctx_send_bin(ctx, vless_resp, 2);
+    if (safe_send(sock, vless_resp, 2) < 0) {
+        printf("[worker] failed to send vless_resp\n");
+        ctx_unref(ctx);
+        goto done;
+    }
     printf("[worker] vless_resp sent\n");
 
     if (task->payload_len > 0) {
-        ssize_t s = send(sock, task->payload, task->payload_len, 0);
+        ssize_t s = safe_send(sock, task->payload, task->payload_len);
         printf("[worker] payload sent: %zd bytes\n", s);
     }
 
-    // Переход в CONNECTED и flush — под одним pending_lock.
-    // Иначе onmessage может увидеть CONNECTED раньше flush
-    // и отправить пакет напрямую раньше буферизованных.
+    /* Переход в CONNECTED и flush — под одним pending_lock */
     pthread_mutex_lock(&ctx->pending_lock);
     atomic_store(&ctx->state, CTX_STATE_CONNECTED);
     for (int i = 0; i < ctx->pending_count; i++) {
-        send(ctx->target_fd, ctx->pending_msgs[i], ctx->pending_sizes[i], 0);
+        safe_send(ctx->target_fd, ctx->pending_msgs[i], ctx->pending_sizes[i]);
         free(ctx->pending_msgs[i]);
     }
     free(ctx->pending_msgs);
@@ -176,7 +187,9 @@ static void connect_worker_handle(connect_task_t *task, int epoll_fd)
     ctx->pending_sizes = NULL;
     ctx->pending_count = 0;
     pthread_mutex_unlock(&ctx->pending_lock);
+
     printf("[worker] state -> CONNECTED, pending flushed\n");
+    ctx_unref(ctx);
 
 done:
     free((void *)task->payload);

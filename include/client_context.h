@@ -8,8 +8,11 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <sys/socket.h>
-
+#include <poll.h>
+#include <errno.h>
+ 
 #include <ws.h>
+
 
 typedef enum {
     CTX_STATE_CONNECTING, // воркер ещё не завершил connect
@@ -51,5 +54,7 @@ void create_ctx(ws_cli_conn_t client, int target_fd);
 void remove_ctx(ws_cli_conn_t client);
 
 bool ctx_send_bin(client_ctx_t *ctx, const unsigned char *data, size_t len);
+
+ssize_t safe_send(int fd, const void *buf, size_t len);
 
 #endif

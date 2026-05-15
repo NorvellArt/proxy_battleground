@@ -12,6 +12,39 @@ static inline int ctx_hash(ws_cli_conn_t client) {
     return ((uintptr_t)client >> 4) & (CTX_HASH_SIZE - 1);
 }
 
+ssize_t safe_send(int fd, const void *buf, size_t len)
+{
+    size_t sent = 0;
+
+    while (sent < len) {
+        ssize_t s = send(fd,
+                         (const char *)buf + sent,
+                         len - sent,
+                         MSG_NOSIGNAL);   /* не получаем SIGPIPE */
+        if (s > 0) {
+            sent += (size_t)s;
+            continue;
+        }
+
+        if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* Буфер ядра заполнен — ждём до 5 секунд */
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            int r = poll(&pfd, 1, 5000);
+            if (r <= 0) {
+                /* таймаут или ошибка poll */
+                return -1;
+            }
+            /* сокет снова готов — повторяем send */
+            continue;
+        }
+
+        /* s == 0 или другая ошибка */
+        return -1;
+    }
+
+    return (ssize_t)sent;
+}
+
 void ctx_unref(client_ctx_t *ctx)
 {
     if (!ctx) return;
@@ -90,7 +123,7 @@ void ctx_flush_pending(client_ctx_t *ctx)
     pthread_mutex_lock(&ctx->pending_lock);
 
     for (int i = 0; i < ctx->pending_count; i++) {
-        send(ctx->target_fd, ctx->pending_msgs[i], ctx->pending_sizes[i], 0);
+        safe_send(ctx->target_fd, ctx->pending_msgs[i], ctx->pending_sizes[i]);
         free(ctx->pending_msgs[i]);
     }
     free(ctx->pending_msgs);
@@ -142,6 +175,7 @@ bool ctx_send_bin(client_ctx_t *ctx, const unsigned char *data, size_t len)
 static void ctx_free(client_ctx_t *ctx)
 {
     pthread_mutex_destroy(&ctx->ws_send_lock);
+    pthread_mutex_destroy(&ctx->pending_lock);
     free(ctx);
     printf("Context freed\n");
 }
