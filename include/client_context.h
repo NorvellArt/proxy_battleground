@@ -36,8 +36,10 @@ typedef struct client_ctx{
     struct client_ctx *next;
 } client_ctx_t;
 
-extern client_ctx_t *ctx_list;
-extern pthread_mutex_t list_lock;
+#define CTX_HASH_SIZE 256
+
+extern client_ctx_t *ctx_table[CTX_HASH_SIZE];
+extern pthread_mutex_t ctx_table_locks[CTX_HASH_SIZE];
 
 client_ctx_t *get_ctx_by_client(ws_cli_conn_t client);
 

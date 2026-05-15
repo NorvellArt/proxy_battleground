@@ -146,14 +146,14 @@ static void connect_worker_handle(connect_task_t *task, int epoll_fd)
     }
 
     ctx->target_fd = sock;
-    
+
     printf("[worker] ctx ok, state -> CONNECTED\n");
 
     struct epoll_event ev = {.events = EPOLLIN, .data.ptr = ctx};
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sock, &ev);
 
     unsigned char vless_resp[] = {0x00, 0x00};
-    ws_sendframe_bin(task->client, (char *)vless_resp, 2);
+    ctx_send_bin(ctx, vless_resp, 2);
     printf("[worker] vless_resp sent\n");
 
     if (task->payload_len > 0) {
@@ -161,11 +161,22 @@ static void connect_worker_handle(connect_task_t *task, int epoll_fd)
         printf("[worker] payload sent: %zd bytes\n", s);
     }
 
+    // Переход в CONNECTED и flush — под одним pending_lock.
+    // Иначе onmessage может увидеть CONNECTED раньше flush
+    // и отправить пакет напрямую раньше буферизованных.
+    pthread_mutex_lock(&ctx->pending_lock);
     atomic_store(&ctx->state, CTX_STATE_CONNECTED);
-    ctx_flush_pending(ctx);
-    printf("[worker] pending flushed\n");
-
-    ctx_unref(ctx);
+    for (int i = 0; i < ctx->pending_count; i++) {
+        send(ctx->target_fd, ctx->pending_msgs[i], ctx->pending_sizes[i], 0);
+        free(ctx->pending_msgs[i]);
+    }
+    free(ctx->pending_msgs);
+    free(ctx->pending_sizes);
+    ctx->pending_msgs  = NULL;
+    ctx->pending_sizes = NULL;
+    ctx->pending_count = 0;
+    pthread_mutex_unlock(&ctx->pending_lock);
+    printf("[worker] state -> CONNECTED, pending flushed\n");
 
 done:
     free((void *)task->payload);

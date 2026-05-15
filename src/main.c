@@ -91,13 +91,21 @@ void onmessage(ws_cli_conn_t client, const unsigned char *msg, uint64_t size, in
     
     if (ctx) {
         if (!atomic_load(&ctx->is_closing)) {
+            pthread_mutex_lock(&ctx->pending_lock);
             if (atomic_load(&ctx->state) == CTX_STATE_CONNECTING) {
-                // Воркер ещё не подключился — буферизуем
-                ctx_enqueue_pending(ctx, msg, size);
+                // pending_lock уже держим — enqueue без своего лока внутри
+                // (ctx_enqueue_pending берёт тот же лок, поэтому вызываем напрямую)
+                unsigned char *copy = malloc(size);
+                memcpy(copy, msg, size);
+                ctx->pending_msgs  = realloc(ctx->pending_msgs,  (ctx->pending_count + 1) * sizeof(unsigned char *));
+                ctx->pending_sizes = realloc(ctx->pending_sizes, (ctx->pending_count + 1) * sizeof(size_t));
+                ctx->pending_msgs[ctx->pending_count]  = copy;
+                ctx->pending_sizes[ctx->pending_count] = size;
+                ctx->pending_count++;
             } else {
-                // Соединение есть — форвардим сразу
                 send(ctx->target_fd, msg, size, 0);
             }
+            pthread_mutex_unlock(&ctx->pending_lock);
         }
         ctx_unref(ctx);
         return;

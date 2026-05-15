@@ -1,10 +1,16 @@
 #include "client_context.h"
 
-static client_ctx_t *get_ctx_inner(ws_cli_conn_t client);
 static void ctx_free(client_ctx_t *ctx);
 
-client_ctx_t *ctx_list = NULL;
-pthread_mutex_t list_lock = PTHREAD_MUTEX_INITIALIZER;
+client_ctx_t *ctx_table[CTX_HASH_SIZE] = {0};
+pthread_mutex_t ctx_table_locks[CTX_HASH_SIZE] = {
+    [0 ... CTX_HASH_SIZE-1] = PTHREAD_MUTEX_INITIALIZER
+};
+
+// ws_cli_conn_t — это указатель, хэшируем его адрес
+static inline int ctx_hash(ws_cli_conn_t client) {
+    return ((uintptr_t)client >> 4) & (CTX_HASH_SIZE - 1);
+}
 
 void ctx_unref(client_ctx_t *ctx)
 {
@@ -17,42 +23,46 @@ void ctx_unref(client_ctx_t *ctx)
 
 client_ctx_t *get_ctx_by_client(ws_cli_conn_t client)
 {
-    pthread_mutex_lock(&list_lock);
-    client_ctx_t *res = get_ctx_inner(client);
-    if (res) {
-        atomic_fetch_add(&res->ref_count, 1); // берём владение
+    int slot = ctx_hash(client);
+    pthread_mutex_lock(&ctx_table_locks[slot]);
+
+    client_ctx_t *curr = ctx_table[slot];
+    while (curr) {
+        if (curr->ws_conn == client) {
+            atomic_fetch_add(&curr->ref_count, 1);
+            pthread_mutex_unlock(&ctx_table_locks[slot]);
+            return curr;
+        }
+        curr = curr->next;
     }
-    pthread_mutex_unlock(&list_lock);
-    return res; // вызывающий должен сделать ctx_unref() после использования
+
+    pthread_mutex_unlock(&ctx_table_locks[slot]);
+    return NULL;
 }
 
 void create_ctx(ws_cli_conn_t client, int target_fd)
 {
-    pthread_mutex_lock(&list_lock);
+    int slot = ctx_hash(client);
 
     client_ctx_t *new_node = malloc(sizeof(client_ctx_t));
-    if (!new_node) {
-        pthread_mutex_unlock(&list_lock);
-        return;
-    }
+    if (!new_node) return;
 
-    new_node->ws_conn = client;
-    new_node->target_fd = target_fd;
+    new_node->ws_conn    = client;
+    new_node->target_fd  = target_fd;
     new_node->is_handshaked = true;
     atomic_init(&new_node->ref_count, 1);
     atomic_init(&new_node->is_closing, false);
     atomic_init(&new_node->state, CTX_STATE_CONNECTING);
     pthread_mutex_init(&new_node->ws_send_lock, NULL);
     pthread_mutex_init(&new_node->pending_lock, NULL);
-    new_node->pending_msgs   = NULL;
-    new_node->pending_sizes  = NULL;
-    new_node->pending_count  = 0;
-    
-    // Вставляем в начало списка
-    new_node->next = ctx_list;
-    ctx_list = new_node;
+    new_node->pending_msgs  = NULL;
+    new_node->pending_sizes = NULL;
+    new_node->pending_count = 0;
 
-    pthread_mutex_unlock(&list_lock);
+    pthread_mutex_lock(&ctx_table_locks[slot]);
+    new_node->next    = ctx_table[slot];
+    ctx_table[slot]   = new_node;
+    pthread_mutex_unlock(&ctx_table_locks[slot]);
 }
 
 // Буферизуем пакет пришедший пока соединение устанавливается
@@ -94,23 +104,24 @@ void ctx_flush_pending(client_ctx_t *ctx)
 
 void remove_ctx(ws_cli_conn_t client)
 {
-    pthread_mutex_lock(&list_lock);
+    int slot = ctx_hash(client);
 
-    client_ctx_t **curr = &ctx_list;
+    pthread_mutex_lock(&ctx_table_locks[slot]);
+
+    client_ctx_t **curr = &ctx_table[slot];
     while (*curr) {
         client_ctx_t *entry = *curr;
         if (entry->ws_conn == client) {
-            *curr = entry->next;  
-            pthread_mutex_unlock(&list_lock);
-
+            *curr = entry->next;
+            pthread_mutex_unlock(&ctx_table_locks[slot]);
             printf("Context removed from list\n");
-            ctx_unref(entry);             // снимаем ссылку списка
+            ctx_unref(entry);
             return;
         }
         curr = &entry->next;
     }
 
-    pthread_mutex_unlock(&list_lock);
+    pthread_mutex_unlock(&ctx_table_locks[slot]);
 }
 
 bool ctx_send_bin(client_ctx_t *ctx, const unsigned char *data, size_t len)
@@ -126,15 +137,6 @@ bool ctx_send_bin(client_ctx_t *ctx, const unsigned char *data, size_t len)
 
     pthread_mutex_unlock(&ctx->ws_send_lock);
     return true;
-}
-
-static client_ctx_t *get_ctx_inner(ws_cli_conn_t client) {
-    client_ctx_t *curr = ctx_list;
-    while (curr) {
-        if (curr->ws_conn == client) return curr;
-        curr = curr->next;
-    }
-    return NULL;
 }
 
 static void ctx_free(client_ctx_t *ctx)
